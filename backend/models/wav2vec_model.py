@@ -188,6 +188,20 @@ class Wav2VecModel:
     def available(self) -> bool:
         return self._available
 
+    def transcribe_detailed(self, audio: np.ndarray, language: str = "en") -> dict:
+        """Return a simple chunk-level structured transcript payload."""
+        text = self.transcribe(audio, language=language)
+        if not text:
+            return {"text": "", "segments": []}
+        return {
+            "text": text,
+            "segments": [{
+                "text": text,
+                "start_s": 0.0,
+                "end_s": float(len(audio) / 16000.0),
+            }],
+        }
+
     def transcribe(self, audio: np.ndarray, language: str = "en") -> str:
         """
         Transcribe audio to text.

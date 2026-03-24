@@ -659,6 +659,54 @@ h1 {
     color: var(--accent);
 }
 
+.transcript-line {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    color: var(--text-primary);
+}
+
+.transcript-line:last-child {
+    color: var(--text-primary);
+}
+
+.speaker-chip {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 96px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: rgba(124, 100, 255, 0.12);
+    border: 1px solid rgba(124, 100, 255, 0.2);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    line-height: 1.3;
+    flex-shrink: 0;
+}
+
+.speaker-chip.pending {
+    color: var(--amber);
+    background: rgba(251, 191, 36, 0.12);
+    border-color: rgba(251, 191, 36, 0.22);
+}
+
+.speaker-chip.hidden {
+    display: none;
+}
+
+.line-text {
+    flex: 1;
+}
+
+.status-line {
+    opacity: 0.6;
+    font-style: italic;
+    color: var(--text-secondary);
+}
+
 @keyframes fadeIn {
     from {
         opacity: 0;

@@ -60,6 +60,42 @@ class FasterWhisperModel:
     def available(self) -> bool:
         return self._available
 
+    def transcribe_detailed(self, audio: np.ndarray, language: str = "en") -> dict:
+        """
+        Transcribe audio and return timestamped segment metadata.
+
+        Returns:
+            Dict with `text` and `segments`.
+        """
+        if not self._available or self.model is None:
+            return {"text": "", "segments": []}
+
+        try:
+            segments, _ = self.model.transcribe(
+                audio,
+                language=language,
+                beam_size=5,
+                vad_filter=False,
+            )
+
+            collected_segments = []
+            for segment in segments:
+                text = segment.text.strip()
+                if not text:
+                    continue
+                collected_segments.append({
+                    "text": text,
+                    "start_s": float(getattr(segment, "start", 0.0) or 0.0),
+                    "end_s": float(getattr(segment, "end", 0.0) or 0.0),
+                })
+
+            full_text = " ".join(segment["text"] for segment in collected_segments).strip()
+            return {"text": full_text, "segments": collected_segments}
+
+        except Exception as e:
+            logger.error(f"Faster-Whisper transcription error: {e}")
+            return {"text": "", "segments": []}
+
     def transcribe(self, audio: np.ndarray, language: str = "en") -> str:
         """
         Transcribe audio to text.
@@ -71,21 +107,4 @@ class FasterWhisperModel:
         Returns:
             Transcribed text string.
         """
-        if not self._available or self.model is None:
-            return ""
-
-        try:
-            segments, info = self.model.transcribe(
-                audio,
-                language=language,
-                beam_size=5,
-                vad_filter=False,  # We handle VAD in the pipeline
-            )
-
-            # Collect all segment texts
-            text = " ".join(segment.text.strip() for segment in segments)
-            return text.strip()
-
-        except Exception as e:
-            logger.error(f"Faster-Whisper transcription error: {e}")
-            return ""
+        return self.transcribe_detailed(audio, language=language)["text"]

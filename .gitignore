@@ -1,3 +1,6 @@
+# Environment variables
+.env
+
 # Python bytecode
 __pycache__/
 *.pyc
@@ -19,3 +22,10 @@ build/
 
 # Personal documentation
 docs/
+
+# Legacy requirement files
+requirements_diarization.txt
+requirements_main.txt
+
+# Nested project folder (development only)
+vadstt_live_v4/

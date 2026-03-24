@@ -49,6 +49,20 @@ class WhisperModel:
         """Whether the model was loaded successfully."""
         return self._available
 
+    def transcribe_detailed(self, audio: np.ndarray, sample_rate: int = 16000, language: str = "en") -> dict:
+        """Return a simple structured transcript payload for the current chunk."""
+        text = self.transcribe(audio, sample_rate=sample_rate, language=language)
+        if not text:
+            return {"text": "", "segments": []}
+        return {
+            "text": text,
+            "segments": [{
+                "text": text,
+                "start_s": 0.0,
+                "end_s": float(len(audio) / sample_rate) if sample_rate > 0 else 0.0,
+            }],
+        }
+
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000, language: str = "en") -> str:
         """
         Transcribe an audio chunk to text.

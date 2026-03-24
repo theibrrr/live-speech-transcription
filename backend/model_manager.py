@@ -33,10 +33,14 @@ class ModelManager:
         self._deepfilter: Optional[DeepFilterNetModel] = None
         self._silero_vad: Optional[SileroVADModel] = None
         self._webrtc_vad: Optional[WebRTCVADModel] = None
+        self._pyannote_diarization = None
+        self._nemo_diarization = None
+        self._speechbrain_diarization = None
 
         # STT cache: keyed by "engine:model_id" to share identical models
         self._stt_cache: dict[str, Any] = {}
         self._stt_lock = Lock()  # Thread-safe access to cache
+        self._diarization_lock = Lock()
         self._loaded = False
 
     # ── Startup Loading (eager for DeepFilter + VAD) ────────────────────
@@ -168,6 +172,127 @@ class ModelManager:
             logger.error(f"Unknown STT engine: {engine}")
             return None
 
+    def get_diarization_model(self, diarization_key: str) -> Optional[Any]:
+        """Load the selected diarization backend lazily."""
+        if diarization_key == "none" or not diarization_key:
+            return None
+
+        if diarization_key == "pyannote":
+            return self._get_pyannote_diarization()
+        if diarization_key == "nemo":
+            return self._get_nemo_diarization()
+        if diarization_key == "speechbrain":
+            return self._get_speechbrain_diarization()
+
+        logger.warning("Unknown diarization key: %s", diarization_key)
+        return None
+
+    def _get_pyannote_diarization(self) -> Optional[Any]:
+        if self._pyannote_diarization is not None:
+            return self._pyannote_diarization
+
+        with self._diarization_lock:
+            if self._pyannote_diarization is not None:
+                return self._pyannote_diarization
+
+            if not Config.pyannote_available():
+                logger.warning("pyannote diarization is not available in the current environment.")
+                return None
+
+            try:
+                from backend.models.pyannote_diarization_model import PyannoteDiarizationModel
+
+                self._pyannote_diarization = PyannoteDiarizationModel(
+                    diarization_model_id=Config.PYANNOTE_DIARIZATION_MODEL_ID,
+                    embedding_model_id=Config.PYANNOTE_EMBEDDING_MODEL_ID,
+                    device=Config.DEVICE,
+                    token=Config.HUGGINGFACE_TOKEN,
+                    local_model_dir=Config.PYANNOTE_MODEL_DIR,
+                    local_embedding_dir=Config.PYANNOTE_EMBEDDING_DIR,
+                )
+                if self._pyannote_diarization.available:
+                    logger.info("pyannote diarization ready.")
+                    return self._pyannote_diarization
+
+                logger.error("pyannote diarization failed to load.")
+                self._pyannote_diarization = None
+                return None
+
+            except Exception as e:
+                logger.error(f"Failed to initialize pyannote diarization: {e}")
+                self._pyannote_diarization = None
+                return None
+
+    def _get_nemo_diarization(self) -> Optional[Any]:
+        if self._nemo_diarization is not None:
+            return self._nemo_diarization
+
+        with self._diarization_lock:
+            if self._nemo_diarization is not None:
+                return self._nemo_diarization
+
+            if not Config.nemo_available():
+                logger.warning("NeMo diarization is not available in the current environment.")
+                return None
+
+            try:
+                from backend.models.nemo_diarization_model import NemoDiarizationModel
+
+                self._nemo_diarization = NemoDiarizationModel(
+                    embedding_model_id=Config.NEMO_EMBEDDING_MODEL_ID,
+                    device=Config.DEVICE,
+                    window_s=Config.DIARIZATION_CLUSTER_WINDOW_S,
+                    hop_s=Config.DIARIZATION_CLUSTER_HOP_S,
+                    cluster_threshold=Config.DIARIZATION_CLUSTER_THRESHOLD,
+                )
+                if self._nemo_diarization.available:
+                    logger.info("NeMo diarization ready.")
+                    return self._nemo_diarization
+
+                logger.error("NeMo diarization failed to load.")
+                self._nemo_diarization = None
+                return None
+
+            except Exception as e:
+                logger.error(f"Failed to initialize NeMo diarization: {e}")
+                self._nemo_diarization = None
+                return None
+
+    def _get_speechbrain_diarization(self) -> Optional[Any]:
+        if self._speechbrain_diarization is not None:
+            return self._speechbrain_diarization
+
+        with self._diarization_lock:
+            if self._speechbrain_diarization is not None:
+                return self._speechbrain_diarization
+
+            if not Config.speechbrain_diarization_available():
+                logger.warning("SpeechBrain diarization is not available in the current environment.")
+                return None
+
+            try:
+                from backend.models.speechbrain_diarization_model import SpeechBrainDiarizationModel
+
+                self._speechbrain_diarization = SpeechBrainDiarizationModel(
+                    embedding_model_id=Config.SPEECHBRAIN_EMBEDDING_MODEL_ID,
+                    device=Config.DEVICE,
+                    window_s=Config.DIARIZATION_CLUSTER_WINDOW_S,
+                    hop_s=Config.DIARIZATION_CLUSTER_HOP_S,
+                    cluster_threshold=Config.DIARIZATION_CLUSTER_THRESHOLD,
+                )
+                if self._speechbrain_diarization.available:
+                    logger.info("SpeechBrain diarization ready.")
+                    return self._speechbrain_diarization
+
+                logger.error("SpeechBrain diarization failed to load.")
+                self._speechbrain_diarization = None
+                return None
+
+            except Exception as e:
+                logger.error(f"Failed to initialize SpeechBrain diarization: {e}")
+                self._speechbrain_diarization = None
+                return None
+
     # ── Accessors ───────────────────────────────────────────────────────
 
     @property
@@ -188,6 +313,9 @@ class ModelManager:
             "deepfilter": self._deepfilter.available if self._deepfilter else False,
             "silero_vad": self._silero_vad.available if self._silero_vad else False,
             "webrtc_vad": self._webrtc_vad.available if self._webrtc_vad else False,
+            "pyannote_diarization": self._pyannote_diarization.available if self._pyannote_diarization else False,
+            "nemo_diarization": self._nemo_diarization.available if self._nemo_diarization else False,
+            "speechbrain_diarization": self._speechbrain_diarization.available if self._speechbrain_diarization else False,
             "stt_cached": list(self._stt_cache.keys()),
             "device": Config.DEVICE,
         }

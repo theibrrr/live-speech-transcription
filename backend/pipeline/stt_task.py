@@ -1,14 +1,14 @@
 """
-stt_task.py — Pipeline task for Speech-to-Text transcription.
+stt_task.py - Pipeline task for speech-to-text transcription.
 
-Dispatches to the correct STT engine (Faster-Whisper or Wav2Vec2)
-based on the model registry in Config.STT_MODELS.
-Models are loaded lazily via ModelManager on first use.
+Dispatches to the correct STT engine based on the model registry in
+Config.STT_MODELS and returns a structured transcription payload.
 """
 
 import logging
-import numpy as np
 from typing import Optional
+
+import numpy as np
 
 from backend.pipeline.base_task import BaseTask
 
@@ -17,28 +17,30 @@ logger = logging.getLogger(__name__)
 
 class STTTask(BaseTask):
     """
-    Speech-to-Text pipeline task — supports multiple STT engines.
+    Speech-to-Text pipeline task supporting multiple STT engines.
 
     Input: Float32 numpy array (16 kHz).
-    Output: Transcribed text string.
+    Output: Dict with `text` and `segments`.
     """
 
-    def __init__(self, model_manager, model_key: str = "fasterwhisper-base", language: str = "en"):
-        """
-        Initialize the STT task.
+    HALLUCINATION_PHRASES = {
+        "you", "thank you", "thanks", "thank you.", "thanks.",
+        "bye", "bye.", "goodbye", "the end", "the end.",
+        "thanks for watching", "thanks for watching.",
+        "thank you for watching", "thank you for watching.",
+        "subscribe", "like and subscribe",
+        "so", "uh", "um", "hmm", "huh", "oh",
+        "mbc news", "amara.org", "www.mooji.org",
+        "podpisivaytes na kanal",
+    }
 
-        Args:
-            model_manager: ModelManager instance for lazy model loading.
-            model_key: Key from Config.STT_MODELS.
-            language: Language code for transcription.
-        """
+    def __init__(self, model_manager, model_key: str = "fasterwhisper-base", language: str = "en"):
         super().__init__(name="STT", enabled=True)
         self.model_manager = model_manager
         self.model_key = model_key
         self.language = language
 
     def set_model(self, model_key: str):
-        """Switch the STT model at runtime."""
         from backend.config import Config
         if model_key in Config.STT_MODELS:
             self.model_key = model_key
@@ -47,50 +49,55 @@ class STTTask(BaseTask):
             logger.warning(f"Unknown STT model: {model_key}")
 
     def set_language(self, language: str):
-        """Switch the transcription language at runtime."""
         self.language = language
         logger.info(f"STT language set to: {language}")
 
-    # ── Known Whisper hallucination phrases ──────────────────────────────
-    HALLUCINATION_PHRASES = {
-        "you", "thank you", "thanks", "thank you.", "thanks.",
-        "bye", "bye.", "goodbye", "the end", "the end.",
-        "thanks for watching", "thanks for watching.",
-        "thank you for watching", "thank you for watching.",
-        "subscribe", "like and subscribe",
-        "so", "uh", "um", "hmm", "huh", "oh",
-        "mbc 뉴스", "amara.org", "www.mooji.org",
-        "подписывайтесь на канал",
-    }
-
-    def process(self, data: np.ndarray) -> Optional[str]:
-        """
-        Transcribe the audio chunk to text.
-
-        Args:
-            data: Float32 numpy array of audio samples (16 kHz).
-
-        Returns:
-            Transcribed text string, or None on failure / silence.
-        """
+    def process(self, data: np.ndarray) -> Optional[dict]:
+        """Transcribe the audio chunk and return structured segment data."""
         if not self.enabled:
             return None
 
-        # Lazy-load the model via ModelManager (language resolves wav2vec variants)
         model = self.model_manager.get_stt_model(self.model_key, self.language)
         if model is None or not model.available:
             logger.warning(f"STT: model '{self.model_key}' not available.")
             return None
 
         try:
-            text = model.transcribe(data, language=self.language)
+            if hasattr(model, "transcribe_detailed"):
+                result = model.transcribe_detailed(data, language=self.language)
+            else:
+                text = model.transcribe(data, language=self.language)
+                result = {
+                    "text": text or "",
+                    "segments": [{
+                        "text": text or "",
+                        "start_s": 0.0,
+                        "end_s": float(len(data) / 16000.0),
+                    }] if text else [],
+                }
 
-            # Filter out known Whisper hallucinations
-            if text and text.strip().lower() in self.HALLUCINATION_PHRASES:
-                logger.debug(f"STT: filtered hallucination: '{text.strip()}'")
+            cleaned_segments = []
+            for segment in result.get("segments", []):
+                text = (segment.get("text") or "").strip()
+                if not text:
+                    continue
+                if text.lower() in self.HALLUCINATION_PHRASES:
+                    logger.debug("STT: filtered hallucination segment '%s'", text)
+                    continue
+                cleaned_segments.append({
+                    "text": text,
+                    "start_s": float(segment.get("start_s", 0.0) or 0.0),
+                    "end_s": float(segment.get("end_s", 0.0) or 0.0),
+                })
+
+            full_text = " ".join(segment["text"] for segment in cleaned_segments).strip()
+            if not full_text:
                 return None
 
-            return text if text else None
+            return {
+                "text": full_text,
+                "segments": cleaned_segments,
+            }
 
         except Exception as e:
             logger.error(f"STT error: {e}")

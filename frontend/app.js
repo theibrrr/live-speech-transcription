@@ -1,52 +1,47 @@
 /**
- * app.js — Frontend client for Real-Time Speech Transcription (v2).
+ * app.js - Frontend client for real-time speech transcription.
  *
  * Handles:
- *   - Dynamic model dropdown populated from /config API
- *   - Dynamic language dropdown based on selected model's supported languages
+ *   - Dynamic model dropdowns populated from /config
+ *   - STT model gating when pyannote diarization is selected
  *   - Microphone capture via getUserMedia (float32 PCM, 16kHz mono)
  *   - WebSocket streaming to the FastAPI backend
- *   - Real-time transcript display and audio visualizer
+ *   - Transcript upserts and late speaker label updates
+ *   - Audio visualizer and live status bar
  */
 
-// ── DOM Elements ───────────────────────────────────────────────────────
 const DOM = {
-    // Settings
     nsSelect: document.getElementById('nsSelect'),
     vadSelect: document.getElementById('vadSelect'),
     sttSelect: document.getElementById('sttSelect'),
+    diarizationSelect: document.getElementById('diarizationSelect'),
+    diarizationHint: document.getElementById('diarizationHint'),
     langSelect: document.getElementById('langSelect'),
     chunkInput: document.getElementById('chunkInput'),
-    settingsPanel: document.getElementById('settingsPanel'),
 
-    // Controls
     btnStart: document.getElementById('btnStart'),
     btnStop: document.getElementById('btnStop'),
     btnClear: document.getElementById('btnClear'),
 
-    // Transcript
     transcriptText: document.getElementById('transcriptText'),
     placeholder: document.getElementById('transcriptPlaceholder'),
 
-    // Status bar
     statLatency: document.getElementById('statLatency'),
     statChunk: document.getElementById('statChunk'),
     statNS: document.getElementById('statNS'),
     statVAD: document.getElementById('statVAD'),
     statSTT: document.getElementById('statSTT'),
+    statSD: document.getElementById('statSD'),
     statLang: document.getElementById('statLang'),
     statDevice: document.getElementById('statDevice'),
 
-    // Connection
     badge: document.getElementById('connectionBadge'),
     badgeText: document.querySelector('.badge-text'),
     logoIcon: document.querySelector('.logo-icon'),
 
-    // Visualizer
     canvas: document.getElementById('visualizerCanvas'),
 };
 
-// ── State ──────────────────────────────────────────────────────────────
 let ws = null;
 let mediaStream = null;
 let audioContext = null;
@@ -54,18 +49,15 @@ let processorNode = null;
 let analyserNode = null;
 let isStreaming = false;
 let animationFrameId = null;
+let serverConfig = null;
 
+const transcriptNodes = new Map();
 const TARGET_SAMPLE_RATE = 16000;
 
 function getChunkDurationMs() {
-    const val = parseInt(DOM.chunkInput.value, 10);
-    return Math.min(5000, Math.max(250, isNaN(val) ? 1000 : val));
+    const value = parseInt(DOM.chunkInput.value, 10);
+    return Math.min(5000, Math.max(250, Number.isNaN(value) ? 1000 : value));
 }
-
-// Server configuration (fetched at startup)
-let serverConfig = null;
-
-// ── Initialization ────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', async () => {
     await fetchServerConfig();
@@ -73,32 +65,32 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupVisualizer();
 });
 
-/**
- * Fetch configuration from the server and populate UI dropdowns.
- */
 async function fetchServerConfig() {
     try {
-        const resp = await fetch('/config');
-        serverConfig = await resp.json();
+        const response = await fetch('/config');
+        serverConfig = await response.json();
 
-        // Update device badge
         const device = serverConfig.device || 'cpu';
         DOM.statDevice.textContent = device.toUpperCase();
         DOM.statDevice.classList.toggle('gpu', device === 'cuda');
         DOM.statDevice.classList.toggle('cpu', device === 'cpu');
 
-        // Check DeepFilterNet availability
         if (!serverConfig.deepfilter_available) {
-            // Remove DeepFilterNet3 option, keep only None
-            const nsOpt = DOM.nsSelect.querySelector('option[value="deepfilter"]');
-            if (nsOpt) nsOpt.remove();
+            const option = DOM.nsSelect.querySelector('option[value="deepfilter"]');
+            if (option) option.remove();
         }
 
-        // Populate STT model dropdown
-        populateSTTModels(serverConfig.stt_models, serverConfig.default_stt_model);
-
-        // Populate language dropdown based on default model
+        populateDiarizationModels(
+            serverConfig.diarization_models || {},
+            serverConfig.default_diarization_model || 'none',
+        );
+        populateSTTModels(
+            serverConfig.stt_models || {},
+            serverConfig.default_stt_model,
+        );
+        applyDiarizationModelConstraints();
         updateLanguageDropdown();
+        updateStatusBar();
 
         console.log('Server config loaded:', serverConfig);
     } catch (err) {
@@ -106,14 +98,28 @@ async function fetchServerConfig() {
     }
 }
 
-/**
- * Populate the STT model dropdown with optgroups.
- */
-function populateSTTModels(sttModels, defaultModel) {
-    const select = DOM.sttSelect;
-    select.innerHTML = '';
+function populateDiarizationModels(models, defaultModel) {
+    DOM.diarizationSelect.innerHTML = '';
 
-    // Group models by their group name
+    for (const [key, model] of Object.entries(models)) {
+        const option = document.createElement('option');
+        option.value = key;
+        option.textContent = model.label || key;
+        option.disabled = model.available === false;
+        if (key === defaultModel && !option.disabled) {
+            option.selected = true;
+        }
+        DOM.diarizationSelect.appendChild(option);
+    }
+
+    if (DOM.diarizationSelect.selectedIndex < 0 && DOM.diarizationSelect.options.length > 0) {
+        DOM.diarizationSelect.selectedIndex = 0;
+    }
+}
+
+function populateSTTModels(sttModels, defaultModel) {
+    DOM.sttSelect.innerHTML = '';
+
     const groups = {};
     for (const [key, model] of Object.entries(sttModels)) {
         const group = model.group || 'Other';
@@ -121,7 +127,6 @@ function populateSTTModels(sttModels, defaultModel) {
         groups[group].push({ key, ...model });
     }
 
-    // Create optgroups
     for (const [groupName, models] of Object.entries(groups)) {
         const optgroup = document.createElement('optgroup');
         optgroup.label = groupName;
@@ -130,75 +135,122 @@ function populateSTTModels(sttModels, defaultModel) {
             const option = document.createElement('option');
             option.value = model.key;
             option.textContent = model.label;
-            if (model.key === defaultModel) option.selected = true;
+            option.dataset.diarizationSupported = String(!!model.diarization_supported);
+            if (model.key === defaultModel) {
+                option.selected = true;
+            }
             optgroup.appendChild(option);
         }
 
-        select.appendChild(optgroup);
+        DOM.sttSelect.appendChild(optgroup);
     }
 }
 
-/**
- * Update the language dropdown based on the selected STT model's supported languages.
- */
+function applyDiarizationModelConstraints() {
+    if (!serverConfig) return;
+
+    const selectedModel = DOM.diarizationSelect.value;
+    const modelInfo = serverConfig.diarization_models?.[selectedModel];
+    if (selectedModel !== 'none' && modelInfo?.available === false) {
+        DOM.diarizationSelect.value = 'none';
+    }
+
+    const diarizationModel = DOM.diarizationSelect.value;
+    const diarizationActive = diarizationModel !== 'none';
+    const sttOptions = [...DOM.sttSelect.querySelectorAll('option')];
+
+    for (const option of sttOptions) {
+        const supported = option.dataset.diarizationSupported === 'true';
+        option.disabled = diarizationActive && !supported;
+    }
+
+    const selectedOption = DOM.sttSelect.selectedOptions[0];
+    if (!selectedOption || selectedOption.disabled) {
+        const firstEnabled = sttOptions.find(option => !option.disabled);
+        if (firstEnabled) {
+            DOM.sttSelect.value = firstEnabled.value;
+        }
+    }
+
+    updateDiarizationHint();
+}
+
+function updateDiarizationHint() {
+    const diarizationModel = DOM.diarizationSelect.value;
+    if (!serverConfig) {
+        DOM.diarizationHint.textContent = 'STT stays live while speaker labels resolve in the background.';
+        return;
+    }
+
+    if (diarizationModel !== 'none') {
+        const label = serverConfig.diarization_models?.[diarizationModel]?.label || diarizationModel;
+        DOM.diarizationHint.textContent = `Only diarization-supported STT models are enabled. Speaker labels start as loading... and update later. (${label})`;
+        return;
+    }
+
+    const anyAvailable = Object.entries(serverConfig.diarization_models || {})
+        .some(([key, model]) => key !== 'none' && model.available !== false);
+
+    if (!anyAvailable) {
+        DOM.diarizationHint.textContent = 'No diarization backends available. Install pyannote.audio, nemo_toolkit, or speechbrain.';
+        return;
+    }
+
+    DOM.diarizationHint.textContent = 'STT stays live while speaker labels resolve in the background.';
+}
+
 function updateLanguageDropdown() {
     if (!serverConfig) return;
 
     const modelKey = DOM.sttSelect.value;
-    const modelConfig = serverConfig.stt_models[modelKey];
+    const modelConfig = serverConfig.stt_models?.[modelKey];
     if (!modelConfig) return;
 
-    const allLanguages = serverConfig.all_languages;
+    const allLanguages = serverConfig.all_languages || {};
     const supportedLangs = modelConfig.languages;
-    const select = DOM.langSelect;
-
-    // Remember current selection
-    const currentLang = select.value;
-    select.innerHTML = '';
+    const currentLang = DOM.langSelect.value;
+    DOM.langSelect.innerHTML = '';
 
     if (supportedLangs === 'all') {
-        // Show all languages
         for (const [code, name] of Object.entries(allLanguages)) {
             const option = document.createElement('option');
             option.value = code;
             option.textContent = name;
-            select.appendChild(option);
+            DOM.langSelect.appendChild(option);
         }
     } else {
-        // Show only supported languages
         for (const code of supportedLangs) {
-            const name = allLanguages[code] || code;
             const option = document.createElement('option');
             option.value = code;
-            option.textContent = name;
-            select.appendChild(option);
+            option.textContent = allLanguages[code] || code;
+            DOM.langSelect.appendChild(option);
         }
     }
 
-    // Restore previous selection if still available, otherwise pick first
-    if ([...select.options].some(o => o.value === currentLang)) {
-        select.value = currentLang;
+    if ([...DOM.langSelect.options].some(option => option.value === currentLang)) {
+        DOM.langSelect.value = currentLang;
     } else {
-        select.selectedIndex = 0;
+        DOM.langSelect.selectedIndex = 0;
     }
-
-    updateStatusBar();
 }
 
-/**
- * Wire up all user interactions.
- */
 function setupEventListeners() {
     DOM.btnStart.addEventListener('click', startStreaming);
     DOM.btnStop.addEventListener('click', stopStreaming);
     DOM.btnClear.addEventListener('click', clearTranscript);
 
-    // Update status bar when settings change
     DOM.nsSelect.addEventListener('change', updateStatusBar);
     DOM.vadSelect.addEventListener('change', updateStatusBar);
     DOM.langSelect.addEventListener('change', updateStatusBar);
     DOM.chunkInput.addEventListener('input', updateStatusBar);
+
     DOM.sttSelect.addEventListener('change', () => {
+        updateLanguageDropdown();
+        updateStatusBar();
+    });
+
+    DOM.diarizationSelect.addEventListener('change', () => {
+        applyDiarizationModelConstraints();
         updateLanguageDropdown();
         updateStatusBar();
     });
@@ -206,32 +258,57 @@ function setupEventListeners() {
     updateStatusBar();
 }
 
-// ── Settings Helpers ──────────────────────────────────────────────────
-
 function getSettings() {
     return {
         ns_enabled: DOM.nsSelect.value !== 'none',
         vad_model: DOM.vadSelect.value,
         stt_model: DOM.sttSelect.value,
+        diarization_model: DOM.diarizationSelect.value,
         language: DOM.langSelect.value,
     };
 }
 
-function updateStatusBar() {
-    const s = getSettings();
-    DOM.statNS.textContent = DOM.nsSelect.value === 'none' ? 'OFF' : 'DeepFilter';
-    DOM.statVAD.textContent = s.vad_model;
-    DOM.statSTT.textContent = s.stt_model;
-    DOM.statLang.textContent = s.language;
+function updateStatusBar(status = null) {
+    const settings = status || getSettings();
+    DOM.statNS.textContent = (settings.ns_enabled || DOM.nsSelect.value !== 'none') ? 'DeepFilter' : 'OFF';
+    DOM.statVAD.textContent = settings.vad_model || DOM.vadSelect.value;
+    DOM.statSTT.textContent = settings.stt_model || DOM.sttSelect.value;
+    DOM.statSD.textContent = settings.diarization_model || DOM.diarizationSelect.value;
+    DOM.statLang.textContent = settings.language || DOM.langSelect.value;
     DOM.statChunk.textContent = `${getChunkDurationMs()} ms`;
 }
 
-// ── Streaming Control ─────────────────────────────────────────────
+function applyServerStatus(status) {
+    if (!status) return;
+
+    if (status.stt_model && serverConfig?.stt_models?.[status.stt_model]) {
+        DOM.sttSelect.value = status.stt_model;
+    }
+    if (status.language) {
+        updateLanguageDropdown();
+        if ([...DOM.langSelect.options].some(option => option.value === status.language)) {
+            DOM.langSelect.value = status.language;
+        }
+    }
+    if (status.vad_model) {
+        DOM.vadSelect.value = status.vad_model;
+    }
+    if (typeof status.ns_enabled === 'boolean') {
+        DOM.nsSelect.value = status.ns_enabled ? 'deepfilter' : 'none';
+    }
+    if (status.diarization_model) {
+        DOM.diarizationSelect.value = status.diarization_model;
+        applyDiarizationModelConstraints();
+    }
+
+    updateStatusBar(status);
+}
 
 function disableSettings(disabled) {
     DOM.nsSelect.disabled = disabled;
     DOM.vadSelect.disabled = disabled;
     DOM.sttSelect.disabled = disabled;
+    DOM.diarizationSelect.disabled = disabled;
     DOM.langSelect.disabled = disabled;
     DOM.chunkInput.disabled = disabled;
 }
@@ -240,7 +317,6 @@ async function startStreaming() {
     if (isStreaming) return;
 
     try {
-        // 1. Get microphone access
         mediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 channelCount: 1,
@@ -248,10 +324,9 @@ async function startStreaming() {
                 echoCancellation: true,
                 noiseSuppression: false,
                 autoGainControl: true,
-            }
+            },
         });
 
-        // 2. Create audio processing pipeline
         audioContext = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
         const source = audioContext.createMediaStreamSource(mediaStream);
 
@@ -280,7 +355,6 @@ async function startStreaming() {
         source.connect(processorNode);
         processorNode.connect(audioContext.destination);
 
-        // 3. Open WebSocket
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
 
@@ -300,13 +374,11 @@ async function startStreaming() {
             if (isStreaming) stopStreaming();
         };
 
-        // 4. Update UI
         isStreaming = true;
         DOM.btnStart.disabled = true;
         DOM.btnStop.disabled = false;
         disableSettings(true);
         setConnectionStatus(true);
-        DOM.placeholder.classList.add('hidden');
         DOM.logoIcon.classList.add('recording');
         startVisualizer();
 
@@ -329,9 +401,18 @@ function stopStreaming() {
     }
     ws = null;
 
-    if (processorNode) { processorNode.disconnect(); processorNode = null; }
-    if (audioContext) { audioContext.close(); audioContext = null; }
-    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    if (processorNode) {
+        processorNode.disconnect();
+        processorNode = null;
+    }
+    if (audioContext) {
+        audioContext.close();
+        audioContext = null;
+    }
+    if (mediaStream) {
+        mediaStream.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+    }
 
     DOM.btnStart.disabled = false;
     DOM.btnStop.disabled = true;
@@ -349,82 +430,142 @@ function sendAudioChunk(chunk) {
 
 function handleServerMessage(msg) {
     if (msg.type === 'config_ack') {
-        console.log('Pipeline configured:', msg.status);
+        applyServerStatus(msg.status);
         return;
     }
+
+    if (msg.type === 'config_update') {
+        applyServerStatus(msg.status);
+        return;
+    }
+
     if (msg.type === 'status') {
-        console.log('Server status:', msg.message);
-        // Show loading message in transcript area
-        const statusDiv = document.createElement('div');
-        statusDiv.className = 'line status-line';
-        statusDiv.textContent = `⏳ ${msg.message}`;
-        statusDiv.style.opacity = '0.5';
-        statusDiv.style.fontStyle = 'italic';
-        DOM.transcriptText.appendChild(statusDiv);
+        appendStatusLine(msg.message);
         return;
     }
+
     if (msg.type === 'transcription') {
         DOM.statLatency.textContent = `${msg.latency} ms`;
-        if (msg.text && msg.text.trim()) {
-            appendTranscript(msg.text.trim());
+        if (Array.isArray(msg.items)) {
+            msg.items.forEach(upsertTranscriptItem);
+        } else if (msg.text && msg.text.trim()) {
+            upsertTranscriptItem({
+                id: `legacy_${Date.now()}`,
+                text: msg.text.trim(),
+                speaker: null,
+                speaker_pending: false,
+            });
         }
+        return;
+    }
+
+    if (msg.type === 'speaker_update' && Array.isArray(msg.updates)) {
+        msg.updates.forEach(applySpeakerUpdate);
     }
 }
 
-// ── Transcript ────────────────────────────────────────────────────────
-
-function appendTranscript(text) {
+function createTranscriptNode(item) {
     const line = document.createElement('div');
-    line.className = 'line';
-    line.textContent = text;
+    line.className = 'line transcript-line';
+    line.dataset.id = item.id;
+
+    const speaker = document.createElement('span');
+    speaker.className = 'speaker-chip';
+
+    const text = document.createElement('span');
+    text.className = 'line-text';
+
+    line.appendChild(speaker);
+    line.appendChild(text);
     DOM.transcriptText.appendChild(line);
+
+    transcriptNodes.set(item.id, { line, speaker, text });
+    return transcriptNodes.get(item.id);
+}
+
+function upsertTranscriptItem(item) {
+    if (!item || !item.id || !item.text) return;
+
+    DOM.placeholder.classList.add('hidden');
+
+    const node = transcriptNodes.get(item.id) || createTranscriptNode(item);
+    node.text.textContent = item.text;
+    renderSpeakerState(node.speaker, item.speaker, !!item.speaker_pending);
+
+    const container = DOM.transcriptText.parentElement;
+    container.scrollTop = container.scrollHeight;
+}
+
+function applySpeakerUpdate(update) {
+    if (!update || !update.id) return;
+
+    const node = transcriptNodes.get(update.id);
+    if (!node) return;
+
+    renderSpeakerState(node.speaker, update.speaker, !!update.speaker_pending);
+}
+
+function renderSpeakerState(speakerNode, speaker, pending) {
+    if (!speaker && !pending) {
+        speakerNode.textContent = '';
+        speakerNode.classList.add('hidden');
+        speakerNode.classList.remove('pending');
+        return;
+    }
+
+    speakerNode.classList.remove('hidden');
+    speakerNode.classList.toggle('pending', pending);
+    speakerNode.textContent = pending ? 'loading...' : speaker;
+}
+
+function appendStatusLine(message) {
+    const line = document.createElement('div');
+    line.className = 'line status-line';
+    line.textContent = `Loading: ${message}`;
+    DOM.transcriptText.appendChild(line);
+    DOM.placeholder.classList.add('hidden');
+
     const container = DOM.transcriptText.parentElement;
     container.scrollTop = container.scrollHeight;
 }
 
 function clearTranscript() {
+    transcriptNodes.clear();
     DOM.transcriptText.innerHTML = '';
     DOM.placeholder.classList.remove('hidden');
 }
-
-// ── UI Helpers ────────────────────────────────────────────────────────
 
 function setConnectionStatus(connected) {
     DOM.badge.classList.toggle('connected', connected);
     DOM.badgeText.textContent = connected ? 'Streaming' : 'Disconnected';
 }
 
-
-
-// ── Audio Visualizer ──────────────────────────────────────────────────
-
 function setupVisualizer() {
     const canvas = DOM.canvas;
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.parentElement.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-
     const ctx = canvas.getContext('2d');
-    ctx.scale(dpr, dpr);
-    drawIdleVisualizer(ctx, rect.width, rect.height);
 
-    window.addEventListener('resize', () => {
-        const r = canvas.parentElement.getBoundingClientRect();
-        canvas.width = r.width * dpr;
-        canvas.height = r.height * dpr;
-        ctx.scale(dpr, dpr);
-        if (!isStreaming) drawIdleVisualizer(ctx, r.width, r.height);
-    });
+    function resizeCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.parentElement.getBoundingClientRect();
+        canvas.width = rect.width * dpr;
+        canvas.height = rect.height * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        if (!isStreaming) {
+            drawIdleVisualizer(ctx, rect.width, rect.height);
+        }
+    }
+
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
 }
 
-function drawIdleVisualizer(ctx, w, h) {
-    ctx.clearRect(0, 0, w, h);
+function drawIdleVisualizer(ctx, width, height) {
+    ctx.clearRect(0, 0, width, height);
     ctx.strokeStyle = 'rgba(124, 100, 255, 0.15)';
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(0, h / 2);
-    ctx.lineTo(w, h / 2);
+    ctx.moveTo(0, height / 2);
+    ctx.lineTo(width, height / 2);
     ctx.stroke();
 }
 
@@ -442,20 +583,25 @@ function startVisualizer() {
         analyserNode.getByteFrequencyData(dataArray);
 
         const rect = canvas.parentElement.getBoundingClientRect();
-        const w = rect.width;
-        const h = rect.height;
-        ctx.clearRect(0, 0, w, h);
+        const width = rect.width;
+        const height = rect.height;
+        ctx.clearRect(0, 0, width, height);
 
         const barCount = Math.min(bufferLength, 80);
-        const barWidth = w / barCount;
+        const barWidth = width / barCount;
         const gap = 2;
 
-        for (let i = 0; i < barCount; i++) {
+        for (let i = 0; i < barCount; i += 1) {
             const value = dataArray[i] / 255;
-            const barHeight = value * h * 0.85;
+            const barHeight = value * height * 0.85;
             const hue = 255 - value * 40;
             ctx.fillStyle = `hsla(${hue}, 70%, 65%, ${0.4 + value * 0.6})`;
-            ctx.fillRect(i * barWidth + gap / 2, (h - barHeight) / 2, barWidth - gap, barHeight || 1);
+            ctx.fillRect(
+                i * barWidth + gap / 2,
+                (height - barHeight) / 2,
+                barWidth - gap,
+                barHeight || 1,
+            );
         }
     }
 
@@ -467,6 +613,7 @@ function stopVisualizer() {
         cancelAnimationFrame(animationFrameId);
         animationFrameId = null;
     }
+
     const canvas = DOM.canvas;
     const rect = canvas.parentElement.getBoundingClientRect();
     const ctx = canvas.getContext('2d');
