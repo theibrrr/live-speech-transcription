@@ -1,0 +1,14 @@
+name: vadstt_live
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+
+dependencies:
+  - python=3.10
+  - pytorch=2.5.1
+  - torchaudio=2.5.1
+  - pytorch-cuda=12.1
+  - pip
+  - setuptools
+  - wheel

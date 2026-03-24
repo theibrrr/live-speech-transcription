@@ -1,0 +1,22 @@
+# ── PyTorch CUDA 12.1 (pinned to prevent CPU-only override) ──
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchaudio==2.5.1+cu121
+
+# ── Core ──
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+numpy>=1.24.0
+scipy>=1.11.0
+soundfile>=0.12.0
+
+# ── STT engines ──
+openai-whisper==20250625
+faster-whisper>=1.0.0
+transformers>=4.35.0
+speechbrain>=1.0.0
+
+# ── Audio processing ──
+webrtcvad-wheels>=2.0.10
+deepfilternet>=0.5.6
