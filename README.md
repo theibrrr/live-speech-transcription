@@ -1,3 +1,5 @@
+![Demo](assets/git.gif)
+
 # Live Speech Transcription
 
 Real-time browser-to-FastAPI speech transcription with modular noise suppression, voice activity detection, and multiple STT backends.
