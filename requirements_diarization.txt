@@ -1,0 +1,18 @@
+# Extra dependencies for the diarization branch.
+# Install AFTER requirements.txt:
+#   pip install -r requirements.txt
+#   pip install -r requirements_diarization.txt
+
+# ── Utilities (required by pyannote/diarization stack) ──
+omegaconf>=2.3.0
+huggingface_hub<1.0
+lightning==2.5.1
+fsspec==2025.10.0
+
+# ── Diarization: pyannote ──
+pyannote.audio==3.4.0
+
+# ── Diarization: NVIDIA NeMo (optional) ──
+# NeMo is installed separately because it overrides torch with CPU-only.
+# Step 1: pip install "nemo_toolkit[asr]>=2.0.0"
+# Step 2: pip install torch==2.5.1+cu121 torchaudio==2.5.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
